@@ -105,6 +105,13 @@ const BBoxQuerySchema = CommonQuerySchema.extend({
     (v) => (Array.isArray(v) ? v : v ? [v] : undefined),
     z.array(z.enum(fieldValues)).optional(),
   ),
+  // Cap for the gallery arm. Without it the whole bbox comes back (half a
+  // million rows for Slovakia at z8). With it the rows are picked in a
+  // deterministic pseudo-random order (CRC32 of the id), so a capped
+  // response is a spatially uniform sample — what a clustering client
+  // needs — instead of a band along the southern edge that `ORDER BY lat`
+  // would give.
+  limit: z.coerce.number().int().min(1).max(50000).optional(),
 }).meta({ title: 'bbox' });
 
 // Safety cap for the wikimedia arm in dense areas; the client also gates it by
@@ -466,6 +473,7 @@ async function byBbox(ctx: ParameterizedContext) {
     license,
     fields,
     sources,
+    limit,
   } = bboxQuery;
 
   const myUserId = ctx.state.user?.id ?? -1;
@@ -545,7 +553,7 @@ async function byBbox(ctx: ParameterizedContext) {
         ? empty
         : sql`${raw(ratingFrom == null ? 'HAVING' : 'AND')} rating <= ${ratingTo}`
     }
-    ORDER BY lat, lon
+    ${limit == null ? raw('ORDER BY lat, lon') : sql`ORDER BY CRC32(picture.id) LIMIT ${limit}`}
   `;
 
   const rows = includeGallery
@@ -662,8 +670,9 @@ async function byBbox(ctx: ParameterizedContext) {
   )[] = [...galleryPictures, ...wikimediaPictures];
 
   // Keep the merged stream ordered so protobuf delta-encoding stays compact
-  // (the gallery arm is already ORDER BY lat, lon; re-sort once merged).
-  if (wikimediaPictures.length > 0) {
+  // (the gallery arm is ORDER BY lat, lon unless capped; re-sort once merged
+  // or sampled).
+  if (wikimediaPictures.length > 0 || limit != null) {
     pictures.sort((a, b) => a.lat - b.lat || a.lon - b.lon);
   }
 
