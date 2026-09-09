@@ -527,16 +527,15 @@ async function byBbox(ctx: ParameterizedContext) {
     );
   }
 
-  const tagJoin =
-    tagArray.length > 0
-      ? tagMode === 'all'
-        ? sql`JOIN (SELECT pictureId FROM pictureTag WHERE name IN (${join(tagArray)}) GROUP BY pictureId HAVING COUNT(DISTINCT name) = ${tagArray.length}) AS pt ON pt.pictureId = picture.id`
-        : sql`JOIN (SELECT DISTINCT pictureId FROM pictureTag WHERE name IN (${join(tagArray)})) AS pt ON pt.pictureId = picture.id`
-      : empty;
-
   const query = sql`SELECT ${raw(sqlFields.join(','))}
     FROM picture
-    ${tagJoin}
+    ${
+      tagArray.length > 0
+        ? tagMode === 'all'
+          ? sql`JOIN (SELECT pictureId FROM pictureTag WHERE name IN (${join(tagArray)}) GROUP BY pictureId HAVING COUNT(DISTINCT name) = ${tagArray.length}) AS pt ON pt.pictureId = picture.id`
+          : sql`JOIN (SELECT DISTINCT pictureId FROM pictureTag WHERE name IN (${join(tagArray)})) AS pt ON pt.pictureId = picture.id`
+        : empty
+    }
     WHERE MBRContains(ST_GeomFromText(${`LINESTRING(${minLon} ${minLat}, ${maxLon} ${maxLat})`}, 4326), location)
     ${takenAtFrom ? sql`AND takenAt >= ${new Date(takenAtFrom)}` : empty}
     ${takenAtTo ? sql`AND takenAt <= ${new Date(takenAtTo)}` : empty}
@@ -558,54 +557,11 @@ async function byBbox(ctx: ParameterizedContext) {
         ? empty
         : sql`${raw(ratingFrom == null ? 'HAVING' : 'AND')} rating <= ${ratingTo}`
     }
-    ORDER BY lat, lon
-  `;
-
-  // Sampled variant: the sort/LIMIT runs over ids alone in a derived table,
-  // so the correlated subqueries in the select list (rating, tags, user,
-  // lastCommentedAt) are evaluated for the sampled rows only, not for every
-  // row in the bbox. Rating filters live in the inner query, since they need
-  // the rating subquery to HAVING against.
-  const innerRating =
-    ratingFrom != null || ratingTo != null ? `, ${ratingSubquery}` : '';
-
-  const sampledQuery = limit == null ? null : sql`SELECT ${raw(sqlFields.join(','))}
-    FROM picture
-    JOIN (
-      -- aliased: the outer select list references \`id\` unqualified
-      SELECT picture.id AS sampledId${raw(innerRating)}
-      FROM picture
-      ${tagJoin}
-      WHERE MBRContains(ST_GeomFromText(${`LINESTRING(${minLon} ${minLat}, ${maxLon} ${maxLat})`}, 4326), location)
-      ${takenAtFrom ? sql`AND takenAt >= ${new Date(takenAtFrom)}` : empty}
-      ${takenAtTo ? sql`AND takenAt <= ${new Date(takenAtTo)}` : empty}
-      ${createdAtFrom ? sql`AND createdAt >= ${new Date(createdAtFrom)}` : empty}
-      ${createdAtTo ? sql`AND createdAt <= ${new Date(createdAtTo)}` : empty}
-      ${pano == null ? empty : sql`AND pano = ${pano}`}
-      ${premium == null ? empty : sql`AND premium = ${premium}`}
-      ${userIdArray.length > 0 ? sql`AND userId IN (${join(userIdArray)})` : empty}
-      ${licenseArray.length > 0 ? sql`AND license IN (${join(licenseArray)})` : empty}
-      ${
-        hasRole(ctx.state.user, 'galleryModerator')
-          ? empty
-          : sql`AND (picture.id NOT IN (SELECT pictureId FROM pictureTag WHERE name = 'private') OR userId = ${myUserId})`
-      }
-      ${tagArray.length === 0 && tag !== undefined ? raw('AND picture.id NOT IN (SELECT pictureId FROM pictureTag)') : empty}
-      ${ratingFrom == null ? empty : sql`HAVING rating >= ${ratingFrom}`}
-      ${
-        ratingTo == null
-          ? empty
-          : sql`${raw(ratingFrom == null ? 'HAVING' : 'AND')} rating <= ${ratingTo}`
-      }
-      ORDER BY CRC32(picture.id)
-      LIMIT ${limit}
-    ) AS sampled ON sampled.sampledId = picture.id
+    ${limit == null ? raw('ORDER BY lat, lon') : sql`ORDER BY CRC32(picture.id) LIMIT ${limit}`}
   `;
 
   const rows = includeGallery
-    ? BboxRowSchema.parse(
-        await pool.query<unknown>(sampledQuery ?? query),
-      )
+    ? BboxRowSchema.parse(await pool.query<unknown>(query))
     : [];
 
   const getRating = fields?.includes('rating');
