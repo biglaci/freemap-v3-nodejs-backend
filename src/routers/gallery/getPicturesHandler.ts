@@ -105,12 +105,16 @@ const BBoxQuerySchema = CommonQuerySchema.extend({
     (v) => (Array.isArray(v) ? v : v ? [v] : undefined),
     z.array(z.enum(fieldValues)).optional(),
   ),
-  // Cap for the gallery arm. Without it the whole bbox comes back (half a
-  // million rows for Slovakia at z8). With it the rows are picked in a
-  // deterministic pseudo-random order (CRC32 of the id), so a capped
-  // response is a spatially uniform sample — what a clustering client
-  // needs — instead of a band along the southern edge that `ORDER BY lat`
-  // would give.
+  // Cap applied to each source separately (so gallery + wikimedia can return
+  // up to 2 x limit; the wikimedia arm is additionally capped at
+  // WIKIMEDIA_BBOX_LIMIT). Without it the whole bbox comes back — half a
+  // million rows for Slovakia at z8. With it the rows are picked in a
+  // deterministic pseudo-random order (CRC32 of the id), which yields a
+  // uniform random sample of the matched set: density-proportional, so
+  // clusters keep their shape, and stable while panning, so the same
+  // pictures stay selected instead of flickering between requests.
+  // `ORDER BY lat` truncation, by contrast, would return a band along the
+  // southern edge.
   limit: z.coerce.number().int().min(1).max(50000).optional(),
 }).meta({ title: 'bbox' });
 
@@ -523,15 +527,16 @@ async function byBbox(ctx: ParameterizedContext) {
     );
   }
 
+  const tagJoin =
+    tagArray.length > 0
+      ? tagMode === 'all'
+        ? sql`JOIN (SELECT pictureId FROM pictureTag WHERE name IN (${join(tagArray)}) GROUP BY pictureId HAVING COUNT(DISTINCT name) = ${tagArray.length}) AS pt ON pt.pictureId = picture.id`
+        : sql`JOIN (SELECT DISTINCT pictureId FROM pictureTag WHERE name IN (${join(tagArray)})) AS pt ON pt.pictureId = picture.id`
+      : empty;
+
   const query = sql`SELECT ${raw(sqlFields.join(','))}
     FROM picture
-    ${
-      tagArray.length > 0
-        ? tagMode === 'all'
-          ? sql`JOIN (SELECT pictureId FROM pictureTag WHERE name IN (${join(tagArray)}) GROUP BY pictureId HAVING COUNT(DISTINCT name) = ${tagArray.length}) AS pt ON pt.pictureId = picture.id`
-          : sql`JOIN (SELECT DISTINCT pictureId FROM pictureTag WHERE name IN (${join(tagArray)})) AS pt ON pt.pictureId = picture.id`
-        : empty
-    }
+    ${tagJoin}
     WHERE MBRContains(ST_GeomFromText(${`LINESTRING(${minLon} ${minLat}, ${maxLon} ${maxLat})`}, 4326), location)
     ${takenAtFrom ? sql`AND takenAt >= ${new Date(takenAtFrom)}` : empty}
     ${takenAtTo ? sql`AND takenAt <= ${new Date(takenAtTo)}` : empty}
@@ -553,11 +558,54 @@ async function byBbox(ctx: ParameterizedContext) {
         ? empty
         : sql`${raw(ratingFrom == null ? 'HAVING' : 'AND')} rating <= ${ratingTo}`
     }
-    ${limit == null ? raw('ORDER BY lat, lon') : sql`ORDER BY CRC32(picture.id) LIMIT ${limit}`}
+    ORDER BY lat, lon
+  `;
+
+  // Sampled variant: the sort/LIMIT runs over ids alone in a derived table,
+  // so the correlated subqueries in the select list (rating, tags, user,
+  // lastCommentedAt) are evaluated for the sampled rows only, not for every
+  // row in the bbox. Rating filters live in the inner query, since they need
+  // the rating subquery to HAVING against.
+  const innerRating =
+    ratingFrom != null || ratingTo != null ? `, ${ratingSubquery}` : '';
+
+  const sampledQuery = limit == null ? null : sql`SELECT ${raw(sqlFields.join(','))}
+    FROM picture
+    JOIN (
+      -- aliased: the outer select list references \`id\` unqualified
+      SELECT picture.id AS sampledId${raw(innerRating)}
+      FROM picture
+      ${tagJoin}
+      WHERE MBRContains(ST_GeomFromText(${`LINESTRING(${minLon} ${minLat}, ${maxLon} ${maxLat})`}, 4326), location)
+      ${takenAtFrom ? sql`AND takenAt >= ${new Date(takenAtFrom)}` : empty}
+      ${takenAtTo ? sql`AND takenAt <= ${new Date(takenAtTo)}` : empty}
+      ${createdAtFrom ? sql`AND createdAt >= ${new Date(createdAtFrom)}` : empty}
+      ${createdAtTo ? sql`AND createdAt <= ${new Date(createdAtTo)}` : empty}
+      ${pano == null ? empty : sql`AND pano = ${pano}`}
+      ${premium == null ? empty : sql`AND premium = ${premium}`}
+      ${userIdArray.length > 0 ? sql`AND userId IN (${join(userIdArray)})` : empty}
+      ${licenseArray.length > 0 ? sql`AND license IN (${join(licenseArray)})` : empty}
+      ${
+        hasRole(ctx.state.user, 'galleryModerator')
+          ? empty
+          : sql`AND (picture.id NOT IN (SELECT pictureId FROM pictureTag WHERE name = 'private') OR userId = ${myUserId})`
+      }
+      ${tagArray.length === 0 && tag !== undefined ? raw('AND picture.id NOT IN (SELECT pictureId FROM pictureTag)') : empty}
+      ${ratingFrom == null ? empty : sql`HAVING rating >= ${ratingFrom}`}
+      ${
+        ratingTo == null
+          ? empty
+          : sql`${raw(ratingFrom == null ? 'HAVING' : 'AND')} rating <= ${ratingTo}`
+      }
+      ORDER BY CRC32(picture.id)
+      LIMIT ${limit}
+    ) AS sampled ON sampled.sampledId = picture.id
   `;
 
   const rows = includeGallery
-    ? BboxRowSchema.parse(await pool.query<unknown>(query))
+    ? BboxRowSchema.parse(
+        await pool.query<unknown>(sampledQuery ?? query),
+      )
     : [];
 
   const getRating = fields?.includes('rating');
@@ -637,7 +685,8 @@ async function byBbox(ctx: ParameterizedContext) {
           WHERE MBRContains(ST_GeomFromText(${`LINESTRING(${minLon} ${minLat}, ${maxLon} ${maxLat})`}, 4326), location)
           ${wmConds.length ? sql`AND ${join(wmConds, ' AND ')}` : empty}
           ${wmRatingConds.length ? sql`HAVING ${join(wmRatingConds, ' AND ')}` : empty}
-          LIMIT ${WIKIMEDIA_BBOX_LIMIT}`),
+          ${limit == null ? empty : raw('ORDER BY CRC32(pageId)')}
+          LIMIT ${limit == null ? WIKIMEDIA_BBOX_LIMIT : Math.min(limit, WIKIMEDIA_BBOX_LIMIT)}`),
       )
     : [];
 
