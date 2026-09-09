@@ -108,13 +108,16 @@ const BBoxQuerySchema = CommonQuerySchema.extend({
   // Cap applied to each source separately (so gallery + wikimedia can return
   // up to 2 x limit; the wikimedia arm is additionally capped at
   // WIKIMEDIA_BBOX_LIMIT). Without it the whole bbox comes back — half a
-  // million rows for Slovakia at z8. With it the rows are picked in a
-  // deterministic pseudo-random order (CRC32 of the id), which yields a
+  // million rows for Slovakia at z8. With it the gallery rows are picked in
+  // a deterministic pseudo-random order (CRC32 of the id), which yields a
   // uniform random sample of the matched set: density-proportional, so
   // clusters keep their shape, and stable while panning, so the same
   // pictures stay selected instead of flickering between requests.
   // `ORDER BY lat` truncation, by contrast, would return a band along the
-  // southern edge.
+  // southern edge. The wikimedia arm stays unordered on purpose: its LIMIT
+  // early-exits the spatial scan (~100x cheaper than a full scan + filesort),
+  // at the price of an R-tree-ordered, spatially lumpy subset — accepted for
+  // a secondary overlay that was already capped that way.
   limit: z.coerce.number().int().min(1).max(50000).optional(),
 }).meta({ title: 'bbox' });
 
@@ -641,7 +644,6 @@ async function byBbox(ctx: ParameterizedContext) {
           WHERE MBRContains(ST_GeomFromText(${`LINESTRING(${minLon} ${minLat}, ${maxLon} ${maxLat})`}, 4326), location)
           ${wmConds.length ? sql`AND ${join(wmConds, ' AND ')}` : empty}
           ${wmRatingConds.length ? sql`HAVING ${join(wmRatingConds, ' AND ')}` : empty}
-          ${limit == null ? empty : raw('ORDER BY CRC32(pageId)')}
           LIMIT ${limit == null ? WIKIMEDIA_BBOX_LIMIT : Math.min(limit, WIKIMEDIA_BBOX_LIMIT)}`),
       )
     : [];
